@@ -9,7 +9,7 @@ import org.apache.spark.sql.cassandra._
 import org.apache.spark.sql.expressions.{Window, WindowSpec}
 import org.apache.spark.sql.functions._
 import org.apache.spark.sql.{Column, Dataset, SaveMode, SparkSession}
-import org.apache.spark.streaming.dstream.InputDStream
+import org.apache.spark.streaming.dstream.{DStream, InputDStream}
 import org.apache.spark.streaming.kafka010.{ConsumerStrategies, KafkaUtils, LocationStrategies}
 import org.apache.spark.streaming.{Seconds, State, StateSpec, StreamingContext}
 
@@ -36,6 +36,9 @@ case class AggregateData(totalSpending: Double, numTx: Int, windowSpendingAvg: D
 case class EvaluatedSimpleTransaction(tx: SimpleTransaction, isPossibleFraud: Boolean)
 
 object Detector {
+  val keyspace: String = "finances"
+  val accountAggregatesTable: String = "account_aggregates"
+
   def main(args: Array[String]): Unit = {
     val spark: SparkSession = SparkSession.builder
       .master("local[3]")
@@ -47,7 +50,7 @@ object Detector {
 
     import spark.implicits._
 
-    val financesDS: Dataset[Transaction] = spark.read.json("Data/finances-small.json")
+    val financesDS: Dataset[Transaction] = spark.read.json("Data/small.json")
       .withColumn(colName = "date",
         col = to_date(unix_timestamp($"Date", "MM/dd/yyyy").cast("timestamp")))
       .as[Transaction]
@@ -67,13 +70,13 @@ object Detector {
         $"Description".as[String])
       .withColumn("RollingAverage", rollingAvgForPrevious4PerAccount)
       .write.mode(SaveMode.Overwrite)
-      .parquet("Output/finances-small")
+      .parquet("Output/small")
 
     if (financesDS.hasColumn("_corrupt_record")) {
       financesDS.where($"_corrupt_record".isNotNull)
         .select($"_corrupt_record")
         .write.mode(SaveMode.Overwrite)
-        .text("Output/corrupt_finances")
+        .text("Output/corrupt")
     }
 
     financesDS
@@ -81,7 +84,7 @@ object Detector {
       .distinct
       .toDF("FullName", "AccountNumber")
       .coalesce(5)
-      .write.mode(SaveMode.Overwrite).json("Output/finances-small-accounts")
+      .write.mode(SaveMode.Overwrite).json("Output/small-accounts")
 
     financesDS
       .select($"account.number".as("accountNumber").as[String],
@@ -101,7 +104,7 @@ object Detector {
       .coalesce(5)
       .write
       .mode(SaveMode.Overwrite)
-      .cassandraFormat("account_aggregates", "finances")
+      .cassandraFormat(accountAggregatesTable, keyspace)
       .save
 
     val checkpointDir = "file:///checkpoint"
@@ -112,14 +115,15 @@ object Detector {
   }
 
   private def createStreamingContext(checkpointDir: String, spark: SparkSession): StreamingContext = {
-    val ssc = new StreamingContext(spark.sparkContext, batchDuration = Seconds(5))
+    val ssc: StreamingContext = new StreamingContext(spark.sparkContext, batchDuration = Seconds(5))
     ssc.checkpoint(checkpointDir)
-    val kafkaStream: InputDStream[ConsumerRecord[String, String]] = KafkaUtils.createDirectStream(
-      ssc,
-      LocationStrategies.PreferConsistent,
-      ConsumerStrategies.Subscribe[String, String](Set("transactions"),
-        Map("metadata.broker.list" -> "localhost:9092", "group.id" -> "transactions-group"))
-    )
+    val kafkaStream: InputDStream[ConsumerRecord[String, String]] = createKafkaStream(ssc)
+    doWithKafkaStream(kafkaStream)
+      .print
+    ssc
+  }
+
+  private def doWithKafkaStream(kafkaStream: InputDStream[ConsumerRecord[String, String]]): DStream[(String, (AggregateData, Double))] = {
     kafkaStream.map((keyVal: ConsumerRecord[String, String]) => tryConversionToSimpleTransaction(keyVal.value()))
       .flatMap(_.right.toOption)
       .map(simpleTx => (simpleTx.account_number, simpleTx))
@@ -129,49 +133,64 @@ object Detector {
         invReduceFunc = (txs, oldTxs) => txs diff oldTxs,
         windowDuration = Seconds(10),
         slideDuration = Seconds(10))
-      .mapWithState(
-        StateSpec.function((_: String,
-                            newTxsOpt: Option[List[SimpleTransaction]],
-                            aggData: State[AggregateData]) => {
-          val newTxs: List[SimpleTransaction] = newTxsOpt.getOrElse(List.empty[SimpleTransaction])
-          val calculatedAggTuple: (Double, Int) = newTxs.foldLeft((0.0, 0))((currAgg, tx) => (currAgg._1 + tx.amount, currAgg._2 + 1))
-          val calculatedAgg = AggregateData(calculatedAggTuple._1, calculatedAggTuple._2,
-            if (calculatedAggTuple._2 > 0) calculatedAggTuple._1 / calculatedAggTuple._2 else 0)
-          val oldAggDataOption: Option[AggregateData] = aggData.getOption
-          aggData.update(
-            oldAggDataOption match {
-              case Some(oldAggData) =>
-                AggregateData(oldAggData.totalSpending + calculatedAgg.totalSpending,
-                  oldAggData.numTx + calculatedAgg.numTx, calculatedAgg.windowSpendingAvg)
-              case None => calculatedAgg
-            }
-          )
-          newTxs.map(tx => EvaluatedSimpleTransaction(tx, tx.amount > 4000))
-        }))
+      .mapWithState(StateSpec.function(stateSpec(_, _, _: State[AggregateData]))) // force eta-expansion
       .stateSnapshots
-      .transform(dStreamRDD => {
-        val sc: SparkContext = dStreamRDD.sparkContext
-        val historicAggsOption: Option[RDD[_]] = sc.getPersistentRDDs
-          .values.find(_.name == "storedHistoric")
-        val historicAggs: RDD[(String, Double)] = historicAggsOption match {
-          case Some(persistedHistoricAggs) =>
-            persistedHistoricAggs.asInstanceOf[RDD[(String, Double)]]
-          case None =>
-            val retrievedHistoricAggs: RDD[(String, Double)] = sc.cassandraTable("finances", "account_aggregates")
-              .select("account_number", "average_transaction")
-              .map(cassandraRow => (
-                cassandraRow.get[String]("account_number"),
-                cassandraRow.get[Double]("average_transaction")))
-            retrievedHistoricAggs.setName("storedHistoric")
-            retrievedHistoricAggs.cache
-        }
-        dStreamRDD.join(historicAggs)
-      })
+      .transform(transfom(_)) // force eta-expansion
       .filter { case (_, (aggData, historicAvg)) =>
-        aggData.averageTx - historicAvg > 2000 || aggData.windowSpendingAvg - historicAvg > 2000
+      aggData.averageTx - historicAvg > 2000 || aggData.windowSpendingAvg - historicAvg > 2000
+    }
+  }
+
+  private def stateSpec(ignored: String,
+                        newTxsOpt: Option[List[SimpleTransaction]],
+                        aggData: State[AggregateData]): List[EvaluatedSimpleTransaction] = {
+    val newTxs: List[SimpleTransaction] = newTxsOpt.getOrElse(List.empty[SimpleTransaction])
+    val calculatedAggTuple: (Double, Int) = newTxs.foldLeft((0.0, 0))((currAgg, tx) => (currAgg._1 + tx.amount, currAgg._2 + 1))
+    val calculatedAgg = AggregateData(calculatedAggTuple._1, calculatedAggTuple._2,
+      if (calculatedAggTuple._2 > 0) calculatedAggTuple._1 / calculatedAggTuple._2 else 0)
+    val oldAggDataOption: Option[AggregateData] = aggData.getOption
+    aggData.update(
+      oldAggDataOption match {
+        case Some(oldAggData) =>
+          AggregateData(oldAggData.totalSpending + calculatedAgg.totalSpending,
+            oldAggData.numTx + calculatedAgg.numTx, calculatedAgg.windowSpendingAvg)
+        case None => calculatedAgg
       }
-      .print
-    ssc
+    )
+    newTxs.map(tx => EvaluatedSimpleTransaction(tx, tx.amount > 4000))
+  }
+
+  private def transfom(dStreamRDD: RDD[(String, AggregateData)]): RDD[(String, (AggregateData, Double))] = {
+    val sc: SparkContext = dStreamRDD.sparkContext
+    val historicAggsOption: Option[RDD[_]] = sc.getPersistentRDDs
+      .values.find(_.name == "storedHistoric")
+    val historicAggs: RDD[(String, Double)] = historicAggsOption match {
+      case Some(persistedHistoricAggs) =>
+        persistedHistoricAggs.asInstanceOf[RDD[(String, Double)]]
+      case None =>
+        val retrievedHistoricAggs: RDD[(String, Double)] = sc.cassandraTable(keyspace, accountAggregatesTable)
+          .select("account_number", "average_transaction")
+          .map(cassandraRow => (
+            cassandraRow.get[String]("account_number"),
+            cassandraRow.get[Double]("average_transaction")))
+        retrievedHistoricAggs.setName("storedHistoric")
+        retrievedHistoricAggs.cache
+    }
+    val result: RDD[(String, (AggregateData, Double))] = dStreamRDD.join(historicAggs)
+    result
+  }
+
+  private def createKafkaStream(ssc: StreamingContext): InputDStream[ConsumerRecord[String, String]] = {
+    val kafkaStream: InputDStream[ConsumerRecord[String, String]] = KafkaUtils.createDirectStream(
+      ssc,
+      LocationStrategies.PreferConsistent,
+      ConsumerStrategies.Subscribe[String, String](
+        Set("transactions"),
+        Map(
+          "metadata.broker.list" -> "localhost:9092",
+          "group.id" -> "transactions-group"))
+    )
+    kafkaStream
   }
 
   def tryConversionToSimpleTransaction(logLine: String): Either[UnparsableTransaction, SimpleTransaction] = {
